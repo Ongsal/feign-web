@@ -176,6 +176,19 @@ const PHASE_DURATIONS = {
   [PHASES.VOTE_RESULT]: 10_000,
 };
 
+// 호스트가 조절 가능한 페이즈
+const PHASE_DURATION_CONFIG = [
+  { key: PHASES.NIGHT, label: '🌙 밤', min: 15, max: 60, step: 5 },
+  { key: PHASES.DAY, label: '💬 낮 (토론)', min: 30, max: 300, step: 10 },
+  { key: PHASES.VOTING, label: '🗳️ 투표', min: 15, max: 60, step: 5 },
+];
+
+function getPhaseDuration(state, phase) {
+  return state?.phaseDurations?.[phase] ?? PHASE_DURATIONS[phase];
+}
+
+const SESSION_KEY_ROOM = 'feign_room';
+
 // 캐릭터 색상
 const PLAYER_COLORS_HEX = [
   '#ef4444', '#3b82f6', '#22c55e', '#eab308',
@@ -919,7 +932,7 @@ function advancePhase(state, actions) {
   if (currentPhase === PHASES.ROLE_REVEAL) {
     next.phase = PHASES.NIGHT;
     next.dayNumber = 1;
-    next.phaseEndTime = nowTs + PHASE_DURATIONS[PHASES.NIGHT];
+    next.phaseEndTime = nowTs + getPhaseDuration(state, PHASES.NIGHT);
     messages.push({ type: 'system', text: '🌙 밤이 찾아왔어요.', ts: nowTs });
     return { next, messages };
   }
@@ -948,7 +961,7 @@ function advancePhase(state, actions) {
     }
 
     next.phase = PHASES.NIGHT_RESULT;
-    next.phaseEndTime = nowTs + PHASE_DURATIONS[PHASES.NIGHT_RESULT];
+    next.phaseEndTime = nowTs + getPhaseDuration(state, PHASES.NIGHT_RESULT);
 
     const winner = checkWinner(next.players);
     if (winner) {
@@ -961,14 +974,14 @@ function advancePhase(state, actions) {
 
   if (currentPhase === PHASES.NIGHT_RESULT) {
     next.phase = PHASES.DAY;
-    next.phaseEndTime = nowTs + PHASE_DURATIONS[PHASES.DAY];
+    next.phaseEndTime = nowTs + getPhaseDuration(state, PHASES.DAY);
     messages.push({ type: 'system', text: '💬 토론 시간입니다.', ts: nowTs });
     return { next, messages };
   }
 
   if (currentPhase === PHASES.DAY) {
     next.phase = PHASES.VOTING;
-    next.phaseEndTime = nowTs + PHASE_DURATIONS[PHASES.VOTING];
+    next.phaseEndTime = nowTs + getPhaseDuration(state, PHASES.VOTING);
     messages.push({ type: 'system', text: '🗳️ 투표 시간!', ts: nowTs });
     return { next, messages };
   }
@@ -977,7 +990,7 @@ function advancePhase(state, actions) {
     const result = resolveVoting(state, actions);
     next.players = result.players;
     next.phase = PHASES.VOTE_RESULT;
-    next.phaseEndTime = nowTs + PHASE_DURATIONS[PHASES.VOTE_RESULT];
+    next.phaseEndTime = nowTs + getPhaseDuration(state, PHASES.VOTE_RESULT);
     if (result.eliminated) {
       const revealed = getRevealedRole(next.players.find(p => p.id === result.eliminated.id));
       const revealedName = revealed ? ROLES[revealed]?.name : '알 수 없음';
@@ -1005,7 +1018,7 @@ function advancePhase(state, actions) {
   if (currentPhase === PHASES.VOTE_RESULT) {
     next.phase = PHASES.NIGHT;
     next.dayNumber = state.dayNumber + 1;
-    next.phaseEndTime = nowTs + PHASE_DURATIONS[PHASES.NIGHT];
+    next.phaseEndTime = nowTs + getPhaseDuration(state, PHASES.NIGHT);
     messages.push({ type: 'system', text: `🌙 ${next.dayNumber}번째 밤.`, ts: nowTs });
     return { next, messages };
   }
@@ -1041,6 +1054,32 @@ export default function App() {
   useEffect(() => {
     if (playerName) sessionStorage.setItem('feign_name', playerName);
   }, [playerName]);
+
+  // 새로고침 자동 재입장
+  useEffect(() => {
+    const savedRoom = sessionStorage.getItem(SESSION_KEY_ROOM);
+    if (!savedRoom || roomCode) return;
+    (async () => {
+      try {
+        const state = await fbGet(stateRef(savedRoom));
+        if (!state) {
+          sessionStorage.removeItem(SESSION_KEY_ROOM);
+          return;
+        }
+        const amIn = state.players?.some(p => p.id === playerId);
+        if (!amIn) {
+          sessionStorage.removeItem(SESSION_KEY_ROOM);
+          return;
+        }
+        setRoomCode(savedRoom);
+        setScreen(state.phase === PHASES.LOBBY ? 'lobby' : 'game');
+      } catch (e) {
+        console.error('rejoin failed', e);
+        sessionStorage.removeItem(SESSION_KEY_ROOM);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 상태 구독
   useEffect(() => {
@@ -1099,6 +1138,46 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [isHost, gameState?.phase, gameState?.phaseEndTime, roomCode]);
 
+  // 호스트: 낮 페이즈에 과반수 건너뛰기 감지 → 투표로 조기 이동
+  useEffect(() => {
+    if (!isHost || !gameState) return;
+    if (gameState.phase !== PHASES.DAY) return;
+
+    const unsub = onValue(actionsRef(roomCode), async (snap) => {
+      const actions = snap.val() || {};
+      const aliveCount = gameState.players.filter((p) => p.alive).length;
+      const skipCount = Object.values(actions).filter((a) => a?.skipVote).length;
+      if (skipCount < Math.floor(aliveCount / 2) + 1) return;
+      if (advanceInFlightRef.current) return;
+      advanceInFlightRef.current = true;
+      try {
+        const fresh = await fbGet(stateRef(roomCode));
+        if (!fresh || fresh.phase !== PHASES.DAY) {
+          return;
+        }
+        const allActions = (await fbGet(actionsRef(roomCode))) || {};
+        const { next, messages } = advancePhase(fresh, allActions);
+        await push(chatRef(roomCode), {
+          type: 'system',
+          text: `⏩ 과반수 건너뛰기로 투표를 시작합니다.`,
+          ts: Date.now(),
+        });
+        await set(stateRef(roomCode), next);
+        if (next.phase !== fresh.phase) {
+          await remove(actionsRef(roomCode));
+        }
+        for (const msg of messages) {
+          await push(chatRef(roomCode), msg);
+        }
+      } catch (e) {
+        console.error('skip advance error', e);
+      } finally {
+        advanceInFlightRef.current = false;
+      }
+    });
+    return () => unsub();
+  }, [isHost, gameState?.phase, gameState?.code, roomCode]);
+
   // ================== 핸들러 ==================
 
   const handleCreateRoom = async () => {
@@ -1118,12 +1197,21 @@ export default function App() {
           doctor: 1, mad: 1, police_civ: 1, investigator_civ: 1,
           cleaner: 1,
         },
+        phaseDurations: {
+          [PHASES.ROLE_REVEAL]: 12_000,
+          [PHASES.NIGHT]: 30_000,
+          [PHASES.NIGHT_RESULT]: 10_000,
+          [PHASES.DAY]: 90_000,
+          [PHASES.VOTING]: 30_000,
+          [PHASES.VOTE_RESULT]: 10_000,
+        },
         privateReveal: {}, voteBoosts: {}, bombsPlanted: [], winner: null,
       };
       await set(stateRef(code), initial);
       await push(chatRef(code), {
         type: 'system', text: `${name}님이 방을 만들었습니다. 코드: ${code}`, ts: Date.now(),
       });
+      sessionStorage.setItem(SESSION_KEY_ROOM, code);
       setRoomCode(code); setScreen('lobby');
     } catch (e) { setError('방 생성 실패: ' + e.message); }
     finally { setLoading(false); }
@@ -1143,6 +1231,7 @@ export default function App() {
       if (players.length >= MAX_PLAYERS) { setError('정원 초과.'); return; }
       if (players.some((p) => p.name === name)) { setError('이름 중복.'); return; }
       if (players.some((p) => p.id === playerId)) {
+        sessionStorage.setItem(SESSION_KEY_ROOM, code);
         setRoomCode(code); setScreen('lobby'); return;
       }
       const nextPlayers = [...players, {
@@ -1154,6 +1243,7 @@ export default function App() {
       await push(chatRef(code), {
         type: 'system', text: `${name}님이 입장했습니다.`, ts: Date.now(),
       });
+      sessionStorage.setItem(SESSION_KEY_ROOM, code);
       setRoomCode(code); setScreen('lobby');
     } catch (e) { setError('입장 실패: ' + e.message); }
     finally { setLoading(false); }
@@ -1176,7 +1266,7 @@ export default function App() {
     const next = {
       ...gameState, players: withRoles,
       phase: PHASES.ROLE_REVEAL,
-      phaseEndTime: Date.now() + PHASE_DURATIONS[PHASES.ROLE_REVEAL],
+      phaseEndTime: Date.now() + getPhaseDuration(gameState, PHASES.ROLE_REVEAL),
       dayNumber: 0, privateReveal: {}, voteBoosts: {}, bombsPlanted: [], winner: null,
     };
     await set(stateRef(gameState.code), next);
@@ -1219,7 +1309,17 @@ export default function App() {
     await update(stateRef(gameState.code), { roleConfig: newConfig });
   };
 
+  const updatePhaseDuration = async (phaseKey, durationMs) => {
+    if (!gameState || !isHost) return;
+    const newDurations = {
+      ...(gameState.phaseDurations || {}),
+      [phaseKey]: durationMs,
+    };
+    await update(stateRef(gameState.code), { phaseDurations: newDurations });
+  };
+
   const leaveRoom = () => {
+    sessionStorage.removeItem(SESSION_KEY_ROOM);
     setRoomCode(''); setGameState(null); setChatMessages([]);
     setScreen('menu');
   };
@@ -1265,7 +1365,7 @@ export default function App() {
       <LobbyScreen
         state={gameState} playerId={playerId} isHost={isHost}
         onStart={handleStartGame} onLeave={leaveRoom} error={error}
-        onUpdateConfig={updateRoleConfig}
+        onUpdateConfig={updateRoleConfig} onUpdateDuration={updatePhaseDuration}
       />
     );
   }
@@ -1330,7 +1430,7 @@ function MenuScreen({ playerName, setPlayerName, inputCode, setInputCode, onCrea
 // 로비 (직업 커스텀 설정)
 // ==========================================================
 
-function LobbyScreen({ state, playerId, isHost, onStart, onLeave, error, onUpdateConfig }) {
+function LobbyScreen({ state, playerId, isHost, onStart, onLeave, error, onUpdateConfig, onUpdateDuration }) {
   const players = state.players || [];
   const config = state.roleConfig || {};
   const total = Object.values(config).reduce((s, v) => s + (v || 0), 0);
@@ -1394,6 +1494,13 @@ function LobbyScreen({ state, playerId, isHost, onStart, onLeave, error, onUpdat
             config={config} isHost={isHost} onUpdate={onUpdateConfig} />
         </div>
 
+        {/* 시간 설정 */}
+        <div className="bg-slate-800/80 rounded-2xl p-6 mb-4 border border-slate-700">
+          <h2 className="font-semibold mb-3">⏱️ 시간 설정</h2>
+          {!isHost && <p className="text-xs text-slate-400 mb-2">호스트만 조절 가능</p>}
+          <PhaseDurationsPanel state={state} isHost={isHost} onUpdate={onUpdateDuration} />
+        </div>
+
         <div className="bg-slate-800/80 rounded-2xl p-6 border border-slate-700">
           {isHost ? (
             <>
@@ -1450,6 +1557,39 @@ function RoleConfigSection({ title, roles, config, isHost, onUpdate }) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function PhaseDurationsPanel({ state, isHost, onUpdate }) {
+  const current = state.phaseDurations || {};
+  return (
+    <div className="space-y-4">
+      {PHASE_DURATION_CONFIG.map((p) => {
+        const ms = current[p.key] ?? PHASE_DURATIONS[p.key];
+        const seconds = Math.round(ms / 1000);
+        return (
+          <div key={p.key}>
+            <div className="flex justify-between text-sm mb-1.5">
+              <span className="text-slate-300">{p.label}</span>
+              <span className="font-mono text-indigo-300">{seconds}초</span>
+            </div>
+            {isHost ? (
+              <input type="range"
+                min={p.min} max={p.max} step={p.step}
+                value={seconds}
+                onChange={(e) => onUpdate(p.key, parseInt(e.target.value, 10) * 1000)}
+                className="w-full accent-indigo-500" />
+            ) : (
+              <div className="w-full h-2 bg-slate-700 rounded">
+                <div className="h-full bg-indigo-500 rounded" style={{
+                  width: `${((seconds - p.min) / (p.max - p.min)) * 100}%`
+                }} />
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1542,6 +1682,11 @@ function GameScreen({ state, now, playerId, isHost, mePlayer, chatMessages, onCh
                 <ActionPanel state={state} mePlayer={mePlayer} onSubmitAction={onSubmitAction} />
               )}
 
+              {/* 토론 건너뛰기 */}
+              {phase === PHASES.DAY && mePlayer?.alive && (
+                <SkipVoteBox state={state} mePlayer={mePlayer} onSubmitAction={onSubmitAction} />
+              )}
+
               {/* 개인 기록 */}
               <PrivateLog state={state} playerId={playerId} />
             </div>
@@ -1569,6 +1714,14 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
 
   const [hovered, setHovered] = useState(null);
 
+  // 내가 선택한 타겟 (로컬 상태 — 시각 피드백용)
+  const [selectedTarget, setSelectedTarget] = useState(null);
+  const [selectedVote, setSelectedVote] = useState(null);
+  useEffect(() => {
+    setSelectedTarget(null);
+    setSelectedVote(null);
+  }, [phase, state.dayNumber]);
+
   // 집 위치 (원형)
   const housePositions = useMemo(() => {
     return players.map((_, i) => {
@@ -1585,7 +1738,6 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
   const getCharPos = (i, p) => {
     if (!p.alive) return housePositions[i];
     if (isNight) return housePositions[i];
-    // 연못: 살아있는 사람들만 모임
     const aliveIndices = players.map((pp, idx) => pp.alive ? idx : null).filter(x => x !== null);
     const myIdx = aliveIndices.indexOf(i);
     const r = 11;
@@ -1596,46 +1748,43 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
     };
   };
 
-  // 클릭 이벤트: 밤엔 타겟 선택, 투표엔 투표
   const blockedIds = getBlockedTargetIds(mePlayer);
   const canTargetAtNight = phase === PHASES.NIGHT && mePlayer?.alive;
   const canVote = phase === PHASES.VOTING && mePlayer?.alive;
 
   const handleHouseClick = (targetId) => {
     if (!mePlayer) return;
-    if (targetId === playerId) return; // 자기 자신 금지
+    if (targetId === playerId) return;
 
     if (canTargetAtNight) {
       const eff = getEffectiveRole(mePlayer);
       const def = ROLES[eff];
       if (!def?.night) return;
       if (blockedIds.has(targetId)) return;
-      // 임포스터는 서로 타겟 불가
       if (isImposterRole(mePlayer.role)) {
         const targetP = players.find(pp => pp.id === targetId);
         if (targetP && isImposterRole(targetP.role)) return;
       }
+      setSelectedTarget(targetId);
       onSubmitAction({ nightTarget: targetId });
     }
     if (canVote) {
       const targetP = players.find(pp => pp.id === targetId);
       if (!targetP?.alive) return;
+      setSelectedVote(targetId);
       onSubmitAction({ vote: targetId });
     }
   };
 
-  // 현재 내 선택 (액션에서 실시간은 구독 안 함, 그냥 서버 반영 후 UI엔 강조 없음 — 간단화)
-  const [myCurrentTarget, setMyCurrentTarget] = useState(null);
-  const [myCurrentVote, setMyCurrentVote] = useState(null);
-  useEffect(() => {
-    setMyCurrentTarget(null);
-    setMyCurrentVote(null);
-  }, [phase]);
+  const selectedPlayerName = useMemo(() => {
+    const id = canTargetAtNight ? selectedTarget : canVote ? selectedVote : null;
+    if (!id) return null;
+    return players.find(p => p.id === id)?.name || null;
+  }, [selectedTarget, selectedVote, canTargetAtNight, canVote, players]);
 
   return (
     <div className="bg-slate-800/60 rounded-xl p-3 border border-slate-700">
       <div className="relative w-full" style={{ aspectRatio: '16/10', minHeight: 300 }}>
-        {/* 밤 별들 */}
         {isNight && (
           <div className="absolute inset-0 pointer-events-none">
             {Array.from({ length: 20 }).map((_, i) => (
@@ -1650,7 +1799,6 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
           </div>
         )}
 
-        {/* 연못 */}
         <div className="absolute rounded-full" style={{
           left: '50%', top: '50%', width: '30%', height: '24%',
           transform: 'translate(-50%, -50%)',
@@ -1669,12 +1817,15 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
           const voteBoostNum = state.voteBoosts?.[p.id] || 0;
           const isTargetable = (canTargetAtNight && !isMe && !isBlocked && p.alive)
                                 || (canVote && !isMe && p.alive);
+          const isSelected = (canTargetAtNight && selectedTarget === p.id)
+                            || (canVote && selectedVote === p.id);
           return (
             <div key={p.id} className="absolute"
               style={{ left: `${pos.left}%`, top: `${pos.top}%`, transform: 'translate(-50%, -50%)' }}>
               <div className="flex flex-col items-center">
                 <div className={`text-xs font-medium mb-1 px-1.5 py-0.5 rounded ${
                   isDead ? 'text-slate-500 line-through bg-slate-900/60'
+                  : isSelected ? 'text-slate-900 bg-yellow-400 font-bold'
                   : 'text-white bg-slate-900/60'}`}>
                   {p.name}{isMe && ' (나)'}
                 </div>
@@ -1685,7 +1836,14 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
                   className={`relative transition-transform ${
                     isTargetable ? 'cursor-pointer hover:scale-110' : 'cursor-default'}`}>
                   <svg viewBox="0 0 80 70" className={`w-16 sm:w-20 ${isDead ? 'opacity-40 grayscale' : ''} ${
-                    isTargetable && hovered === p.id ? 'drop-shadow-[0_0_10px_rgba(99,102,241,0.8)]' : 'drop-shadow-md'}`}>
+                    isSelected
+                      ? 'drop-shadow-[0_0_18px_rgba(250,204,21,1)] scale-110'
+                      : isTargetable && hovered === p.id
+                        ? 'drop-shadow-[0_0_10px_rgba(99,102,241,0.8)]'
+                        : 'drop-shadow-md'}`}>
+                    {isSelected && (
+                      <circle cx="40" cy="38" r="36" fill="none" stroke="#facc15" strokeWidth="3" opacity="0.8" />
+                    )}
                     <polygon points="10,35 40,10 70,35" fill={isNight ? '#4a2817' : '#7c3f1d'} />
                     <rect x="15" y="35" width="50" height="30" fill={isNight ? '#8b7355' : '#d4a574'} />
                     <rect x="35" y="48" width="10" height="17" fill="#5c2a0e" rx="1" />
@@ -1694,7 +1852,12 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
                     )}
                     <rect x="20" y="42" width="10" height="8" fill={isNight ? '#1e293b' : '#7dd3fc'} opacity="0.8" />
                   </svg>
-                  {isBlocked && !isMe && canTargetAtNight && (
+                  {isSelected && (
+                    <div className="absolute -top-2 -right-2 w-6 h-6 bg-yellow-400 text-slate-900 rounded-full flex items-center justify-center text-xs font-bold border-2 border-slate-900">
+                      ✓
+                    </div>
+                  )}
+                  {isBlocked && !isMe && canTargetAtNight && !isSelected && (
                     <div className="absolute -top-1 -right-1 text-xs bg-slate-800 rounded px-1 text-yellow-400">✕</div>
                   )}
                 </button>
@@ -1703,7 +1866,7 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
           );
         })}
 
-        {/* 캐릭터들 (절대 위치, 애니메이션 전환) */}
+        {/* 캐릭터들 */}
         {players.map((p, i) => {
           const pos = getCharPos(i, p);
           return (
@@ -1712,7 +1875,15 @@ function VillageMap({ state, playerId, mePlayer, phase, onSubmitAction }) {
         })}
       </div>
 
-      {(canTargetAtNight || canVote) && (
+      {/* 선택 요약 */}
+      {selectedPlayerName && (
+        <div className="mt-2 bg-yellow-500/20 border-2 border-yellow-400 rounded-lg px-3 py-2 text-sm text-center">
+          {canTargetAtNight && <>🎯 <b className="text-yellow-300">{selectedPlayerName}</b> 님을 타겟으로 선택했어요 <span className="text-slate-400">(시간 내에 다시 클릭해서 변경 가능)</span></>}
+          {canVote && <>🗳️ <b className="text-yellow-300">{selectedPlayerName}</b> 님에게 투표 <span className="text-slate-400">(변경 가능)</span></>}
+        </div>
+      )}
+
+      {(canTargetAtNight || canVote) && !selectedPlayerName && (
         <p className="text-xs text-slate-400 mt-2 text-center">
           {canTargetAtNight && '🌙 밤 행동: 집을 클릭해서 타겟 선택'}
           {canVote && '🗳️ 투표: 집을 클릭해서 추방 대상 선택'}
@@ -1829,6 +2000,55 @@ function ActionPanel({ state, mePlayer, onSubmitAction }) {
         {isMagician && '집 선택 + 직업 추측 둘 다 필요.'}
         {(isImp && !needsKillOrAbility) && '집 선택 필요.'}
       </p>
+    </div>
+  );
+}
+
+// ==========================================================
+// 토론 건너뛰기
+// ==========================================================
+
+function SkipVoteBox({ state, mePlayer, onSubmitAction }) {
+  const [mySkip, setMySkip] = useState(false);
+  const [skipCount, setSkipCount] = useState(0);
+
+  useEffect(() => { setMySkip(false); }, [state.phase, state.dayNumber]);
+
+  useEffect(() => {
+    if (!state?.code) return;
+    const unsub = onValue(actionsRef(state.code), (snap) => {
+      const actions = snap.val() || {};
+      let count = 0;
+      for (const a of Object.values(actions)) {
+        if (a?.skipVote) count++;
+      }
+      setSkipCount(count);
+    });
+    return () => unsub();
+  }, [state?.code]);
+
+  const aliveCount = state.players.filter(p => p.alive).length;
+  const needed = Math.floor(aliveCount / 2) + 1;
+
+  const handleSkip = () => {
+    const newState = !mySkip;
+    setMySkip(newState);
+    onSubmitAction({ skipVote: newState });
+  };
+
+  return (
+    <div className="bg-slate-800/60 rounded-xl p-3 border border-slate-700 flex items-center gap-3">
+      <button onClick={handleSkip}
+        className={`px-4 py-2 rounded font-medium text-sm transition ${
+          mySkip ? 'bg-yellow-600 hover:bg-yellow-500' : 'bg-slate-700 hover:bg-slate-600'}`}>
+        {mySkip ? '✓ 건너뛰기 취소' : '⏩ 토론 건너뛰기'}
+      </button>
+      <div className="flex-1 text-sm text-slate-300">
+        <span className={skipCount >= needed ? 'text-yellow-300 font-semibold' : ''}>
+          {skipCount}/{needed}명
+        </span>
+        <span className="text-slate-500 ml-2 text-xs">과반수면 투표로 바로 이동</span>
+      </div>
     </div>
   );
 }
